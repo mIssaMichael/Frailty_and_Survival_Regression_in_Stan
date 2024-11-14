@@ -1,0 +1,1312 @@
+---
+title: "Frailty and Survival Regression Models in Stan"
+author: "Michael Issa"
+date: "October 2024"
+date-format: "MMMM YYYY"
+toc: true
+number-sections: true
+highlight: pygments
+crossref:
+  lst-title: "Stan Program"
+filters:
+   - include-code-files
+format:
+  html:
+    html-math-method: katex
+    theme:
+      - lux
+      - custom.scss
+    standalone: true
+    embed-resources: true
+    code-overflow: wrap
+    linkcolor: "#B97C7C"
+  pdf:
+    keep-tex: true
+    fig-width: 5.5
+    fig-height: 5.5
+    code-overflow: wrap
+    monofontoptions:
+      - Scale=0.5
+format-links: false
+---
+# Survival Regression Models
+
+```{python}
+import arviz as az
+import preliz as pz
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import warnings
+import os
+
+from cmdstanpy import CmdStanModel, from_csv
+
+warnings.filterwarnings("ignore")
+
+# Graphic configuration
+c_light = "#DCBCBC"
+c_light_highlight = "#C79999"
+c_mid = "#B97C7C"
+c_mid_highlight = "#A25050"
+c_dark = "#8F2727"
+c_dark_highlight = "#7C0000"
+
+c_light_teal = "#6B8E8E"
+c_mid_teal = "#487575"
+c_dark_teal = "#1D4F4F"
+
+RANDOM_SEED = 58583389
+np.random.seed(RANDOM_SEED)
+az.style.use("arviz-whitegrid")
+
+plt.rcParams['font.family'] = 'serif'
+
+plt.rcParams['xtick.labelsize'] = 12  
+plt.rcParams['ytick.labelsize'] = 12  
+plt.rcParams['axes.labelsize'] = 12  
+plt.rcParams['axes.titlesize'] = 12   
+
+plt.rcParams['axes.spines.top'] = False
+plt.rcParams['axes.spines.right'] = False
+plt.rcParams['axes.spines.left'] = True
+plt.rcParams['axes.spines.bottom'] = True
+
+plt.rcParams['axes.xmargin'] = 0  
+plt.rcParams['axes.ymargin'] = 0  
+
+plt.subplots_adjust(left=0.15, bottom=0.15, right=0.9, top=0.85)
+
+current_working_directory = os.getcwd()
+p_dir = os.path.join(os.path.dirname(current_working_directory), "Frailty_and_Survival_Regression_in_Stan")
+```
+
+# Exploration of Data
+```{python}
+retention_df = pd.read_csv(os.path.join(current_working_directory, 'data', 'job_retention.csv'))
+
+retention_df.info()
+```
+
+```{python}
+dummies = pd.concat(
+    [
+        pd.get_dummies(retention_df["gender"], drop_first=True),
+        pd.get_dummies(retention_df["level"], drop_first=True),
+        pd.get_dummies(retention_df["field"], drop_first=True),
+    ],
+    axis=1,
+).rename({"M": "Male"}, axis=1)
+
+retention_df = pd.concat([retention_df, dummies], axis=1).sort_values("Male").reset_index(drop=True)
+retention_df.head()
+
+```
+
+
+```{python}
+# Stan data
+stan_data_1 = {
+  'N': len(retention_df['month']),
+  'durations': retention_df['month'],
+  'event_observed': retention_df['left'],
+}
+
+# Fit the model
+KM_model_path = os.path.join(p_dir, 'models', 'kaplan_meier.stan')
+KM_model_samples = os.path.join(p_dir, 'models', 'kaplan_meier.csv')
+KM_model = CmdStanModel(stan_file=KM_model_path)
+```
+
+```{python}
+# Fit model
+if os.path.exists(KM_model_samples):
+    km_fit = from_csv(KM_model_samples, method='sample')
+    print("Model loaded from existing samples.")
+else:
+    km_fit = KM_model.sample(data=stan_data_1, seed=RANDOM_SEED, chains=4, iter_sampling=1, iter_warmup=1, show_console=True)
+    km_fit.save_csvfiles(KM_model_samples)  
+    print("Model run and saved.")
+
+```
+
+```{python}
+km_results = km_fit.km_results
+
+times = np.mean(km_results[:, :, 0], axis=0)
+survival_prob = np.mean(km_results[:, :, 1], axis=0)
+  
+
+km_data = pd.DataFrame({
+    'Time': times,
+    'Survival Probability': survival_prob,
+})
+```
+
+```{python},5
+plt.figure(figsize=(10, 6))
+
+sns.lineplot(x='Time', y='Survival Probability', data=km_data, drawstyle='steps-post', color='darkred', label='Kaplan-Meier Estimate')
+
+plt.xlabel('Time (Duration)')
+plt.ylabel('Survival Probability')
+plt.title('Kaplan-Meier Survival Curve with 95% Confidence Interval')
+plt.ylim(0, 1)
+plt.grid(True)
+plt.legend()
+plt.show()
+
+```
+
+
+```{python}
+KM_model_path = os.path.join(p_dir, 'models', 'kaplan_meier.stan')
+KM_model = CmdStanModel(stan_file=KM_model_path)
+
+def fit_model(data, model, random_seed):
+   
+    stan_data = {
+        'N': len(data["month"]),
+        'durations': data["month"],
+        'event_observed': data["left"],
+    }
+    
+    
+    km_fit = model.sample(data=stan_data, seed=random_seed, chains=4, iter_sampling=1, iter_warmup=1, show_console=False)
+    
+
+    km_results = km_fit.stan_variable('km_results')
+    times = np.mean(km_results[:, :, 0], axis=0)
+    survival_prob = np.mean(km_results[:, :, 1], axis=0)
+
+    return times, survival_prob
+
+datasets = {
+    'kmf': retention_df,  
+    'kmf_hi': retention_df[retention_df["sentiment"] == 10],  
+    'kmf_mid': retention_df[retention_df["sentiment"] == 5],  
+    'kmf_low': retention_df[retention_df["sentiment"] == 2],  
+}
+
+plt.figure(figsize=(10, 6))
+
+all_times = []
+all_survival_probs = []
+labels = []
+
+for label, data in datasets.items():
+    times, survival_prob = fit_model(data, KM_model, RANDOM_SEED)
+    all_times.append(times)
+    all_survival_probs.append(survival_prob)
+    labels.append(label)
+
+for i in range(len(all_times)):
+    sns.lineplot(x=all_times[i], y=all_survival_probs[i], drawstyle='steps-post', label=labels[i])
+
+plt.xlabel('Time (Duration)')
+plt.ylabel('Survival Probability')
+plt.title('Kaplan-Meier Survival Curves')
+plt.ylim(0, 1)
+plt.grid(True)
+plt.legend()
+plt.show()
+
+```
+
+# Data Preperation For Survival Regression
+You could write this in the transfromed data section of the stan code but it's so much easier to just transform and pass it. 
+
+```{python}
+intervals = np.arange(12)
+n_employees = retention_df.shape[0]
+n_intervals = len(intervals)
+last_period = np.floor((retention_df.month - 0.01) / 1).astype(int)
+employees = np.arange(n_employees)
+quit = np.zeros((n_employees, n_intervals))
+quit[employees, last_period] = retention_df["left"]
+quit = quit.astype(int)
+pd.DataFrame(quit)
+```
+
+```{python}
+exposure = np.greater_equal.outer(retention_df.month.to_numpy(), intervals) * 1
+exposure[employees, last_period] = retention_df.month - intervals[last_period]
+pd.DataFrame(exposure)
+```
+
+# Fit Basic Cox Model with Fixed Effects
+
+```{python}
+preds = [
+    "sentiment",
+    "Male",
+    "Low",
+    "Medium",
+    "Finance",
+    "Health",
+    "Law",
+    "Public/Government",
+    "Sales/Marketing",
+]
+preds2 = [
+    "sentiment",
+    "intention",
+    "Male",
+    "Low",
+    "Medium",
+    "Finance",
+    "Health",
+    "Law",
+    "Public/Government",
+    "Sales/Marketing",
+]
+
+
+stan_data_2 = {
+  'N': len(retention_df),
+  'P': len(preds),
+  'K': n_intervals,
+  'X_data': retention_df[preds].astype(int),
+  'quit': quit,
+  'exposure': exposure,
+}
+
+stan_data_3 = {
+  'N': len(retention_df),
+  'P': len(preds2),
+  'K': n_intervals,
+
+  'X_data': retention_df[preds2].astype(int),
+  'quit': quit,
+  'exposure': exposure,
+}
+
+# Cox PH model
+cox_model_path = os.path.join(p_dir, 'models', 'log_poisson.stan')
+cox_model_base_samples = os.path.join(p_dir, 'models', 'log_poisson_base.csv')
+cox_model_intention_samples = os.path.join(p_dir, 'models', 'log_poisson_intentions.csv')
+cox_model = CmdStanModel(stan_file=cox_model_path)
+```
+
+```{python}
+# Fit model
+if os.path.exists(cox_model_base_samples):
+    cox_fit_base = from_csv(cox_model_base_samples, method='sample')
+    print("Model loaded from existing samples.")
+else:
+    cox_fit_base = cox_model.sample(data=stan_data_2, seed=RANDOM_SEED, chains=4, parallel_chains=4, iter_sampling=1000, show_console=True)
+    cox_fit_base.save_csvfiles(cox_model_base_samples)
+    print("Model run and saved.")
+
+if os.path.exists(cox_model_intention_samples):
+    cox_fit_intention = from_csv(cox_model_intention_samples, method='sample')
+    print("Model loaded from existing samples.")
+else:
+    cox_fit_intention = cox_model.sample(data=stan_data_3, seed=RANDOM_SEED, chains=4,parallel_chains=4, iter_sampling=1000, show_console=True)
+    cox_fit_intention.save_csvfiles(cox_model_intention_samples)
+    print("Model run and saved.")
+
+
+
+```
+
+```{python}
+base_idata = az.from_cmdstanpy(
+    cox_fit_base,
+    log_likelihood="log_lik",
+    dims={'beta': ['preds'], 'log_lik': ['individuals', 'intervals'], 'lambda0': ['intervals']},
+    coords={
+        'preds': preds,  # Predictor names or indices
+        'individuals': list(range(len(retention_df))),  # Coordinates for individuals
+        'intervals': list(range(n_intervals))  # Coordinates for intervals
+    }
+)
+
+base_intention_idata = az.from_cmdstanpy(
+    cox_fit_intention,
+    log_likelihood="log_lik",
+    dims={'beta': ['preds'], 'log_lik': ['individuals', 'intervals'], 'lambda0': ['intervals']},
+    coords={
+        'preds': preds2,  # Predictor names or indices
+        'individuals': list(range(len(retention_df))),  # Coordinates for individuals
+        'intervals': list(range(n_intervals))  # Coordinates for intervals
+    }
+)
+
+
+
+```
+
+```{python}
+compare = az.compare({"sentiment": base_idata, "intention": base_intention_idata}, ic="waic")
+compare
+```
+
+```{python}
+az.plot_compare(compare)
+```
+
+## Interpreting the Model Coefficients
+```{python}
+m = (
+    az.summary(base_idata, var_names=["beta"])
+    .reset_index()[["index", "mean"]]
+    .rename({"mean": "expected_hr"}, axis=1)
+)
+m1 = (
+    az.summary(base_intention_idata, var_names=["beta"])
+    .reset_index()[["index", "mean"]]
+    .rename({"mean": "expected_intention_hr"}, axis=1)
+)
+m = m.merge(m1, left_on="index", right_on="index", how="outer")
+m["exp(expected_hr)"] = np.exp(m["expected_hr"])
+m["exp(expected_intention_hr)"] = np.exp(m["expected_intention_hr"])
+m
+
+```
+
+
+```{python}
+fig, ax = plt.subplots(figsize=(20, 6))
+ax.plot(base_idata["posterior"]["lambda0"].mean(("draw", "chain")), color="black")
+az.plot_hdi(
+    range(12),
+    base_idata["posterior"]["lambda0"],
+    color= c_mid,
+    ax=ax,
+    hdi_prob=0.99,
+    fill_kwargs={"label": "Baseline Hazard 99%", "alpha": 0.3},
+    smooth=False,
+)
+az.plot_hdi(
+    range(12),
+    base_idata["posterior"]["lambda0"],
+    color=c_mid,
+    ax=ax,
+    hdi_prob=0.50,
+    fill_kwargs={"label": "Baseline Hazard 50%", "alpha": 0.8},
+    smooth=False,
+)
+ax.legend()
+ax.set_xlabel("Time")
+ax.set_title("Expected Baseline Hazard", fontsize=20)
+
+
+```
+
+## Predicting Marginal Effects of CoxPH regression
+
+```{python}
+def cum_hazard(hazard):
+    """Takes arviz.InferenceData object applies
+    cumulative sum along baseline hazard"""
+    return hazard.cumsum(dim="intervals")
+
+
+def survival(hazard):
+    """Takes arviz.InferenceData object transforms
+    cumulative hazard into survival function"""
+    return np.exp(-cum_hazard(hazard))
+
+
+def get_mean(trace):
+    """Takes arviz.InferenceData object marginalises
+    over the chain and draw"""
+    return trace.mean(("draw", "chain"))
+```
+
+
+```{python}
+def extract_individual_hazard(idata, i, retention_df, intention=False):
+    beta = idata.posterior["beta"]
+    if intention:
+        intention_posterior = beta.sel(preds="intention")
+    else:
+        intention_posterior = 0
+    hazard_base_m1 = idata["posterior"]["lambda0"]
+
+    full_hazard_idata = hazard_base_m1 * np.exp(
+        beta.sel(preds="sentiment") * retention_df.iloc[i]["sentiment"]
+        + np.where(intention, intention_posterior * retention_df.iloc[i]["intention"], 0)
+        + beta.sel(preds="Male") * retention_df.iloc[i]["Male"]
+        + beta.sel(preds="Low") * retention_df.iloc[i]["Low"]
+        + beta.sel(preds="Medium") * retention_df.iloc[i]["Medium"]
+        + beta.sel(preds="Finance") * retention_df.iloc[i]["Finance"]
+        + beta.sel(preds="Health") * retention_df.iloc[i]["Health"]
+        + beta.sel(preds="Law") * retention_df.iloc[i]["Law"]
+        + beta.sel(preds="Public/Government") * retention_df.iloc[i]["Public/Government"]
+        + beta.sel(preds="Sales/Marketing") * retention_df.iloc[i]["Sales/Marketing"]
+    )
+
+    cum_haz_idata = cum_hazard(full_hazard_idata)
+    survival_idata = survival(full_hazard_idata)
+    return full_hazard_idata, cum_haz_idata, survival_idata, hazard_base_m1
+
+
+def plot_individuals(retention_df, idata, individuals=[1, 300, 700], intention=False):
+    fig, axs = plt.subplots(1, 2, figsize=(20, 7))
+    axs = axs.flatten()
+    colors = [c_light_highlight, c_mid_highlight, c_dark_highlight]
+    for i, c in zip(individuals, colors):
+        haz_idata, cum_haz_idata, survival_idata, base_hazard = extract_individual_hazard(
+            idata, i, retention_df, intention
+        )
+        axs[0].plot(get_mean(survival_idata), label=f"individual_{i}", color=c)
+        az.plot_hdi(range(12), survival_idata, ax=axs[0], fill_kwargs={"color": c})
+        axs[1].plot(get_mean(cum_haz_idata), label=f"individual_{i}", color=c)
+        az.plot_hdi(range(12), cum_haz_idata, ax=axs[1], fill_kwargs={"color": c})
+        axs[0].set_title("Individual Survival Functions", fontsize=20)
+        axs[1].set_title("Individual Cumulative Hazard Functions", fontsize=20)
+    az.plot_hdi(
+        range(12),
+        survival(base_hazard),
+        color= 'lightblue',
+        ax=axs[0],
+        fill_kwargs={"label": "Baseline Survival"},
+    )
+    axs[0].plot(
+        get_mean(survival(base_hazard)),
+        color='black',
+        linestyle="--",
+        label="Expected Baseline Survival",
+    )
+    az.plot_hdi(
+        range(12),
+        cum_hazard(base_hazard),
+        color='lightblue',
+        ax=axs[1],
+        fill_kwargs={"label": "Baseline Hazard"},
+    )
+    axs[1].plot(
+        get_mean(cum_hazard(base_hazard)),
+        color="black",
+        linestyle="--",
+        label="Expected Baseline Hazard",
+    )
+    axs[0].legend()
+    axs[0].set_ylabel("Probability of Survival")
+    axs[1].set_ylabel("Cumulative Hazard Risk")
+    axs[0].set_xlabel("Time")
+    axs[1].set_xlabel("Time")
+    axs[1].legend()
+
+
+#### Next set up test-data input to explore the relationship between levels of the variables.
+test_df = pd.DataFrame(np.zeros((3, 15)), columns=retention_df.columns)
+test_df["sentiment"] = [1, 5, 10]
+test_df["intention"] = [1, 5, 10]
+test_df["Medium"] = [0, 0, 0]
+test_df["Finance"] = [0, 0, 0]
+test_df["M"] = [1, 1, 1]
+test_df
+
+```
+
+## The Intention Model
+
+```{python}
+plot_individuals(test_df, base_intention_idata, [0, 1, 2], intention=True)
+```
+
+## The Sentiment Model
+
+```{python}
+plot_individuals(test_df, base_idata, [0, 1, 2], intention=False)
+```
+
+## Make Predictions for Individual Characteristics
+
+```{python}
+def create_predictions(retention_df, idata, intention=False):
+    cum_haz = {}
+    surv = {}
+    for i in range(len(retention_df)):
+        haz_idata, cum_haz_idata, survival_idata, base_hazard = extract_individual_hazard(
+            idata, i, retention_df, intention=intention
+        )
+        cum_haz[i] = get_mean(cum_haz_idata)
+        surv[i] = get_mean(survival_idata)
+    cum_haz = pd.DataFrame(cum_haz)
+    surv = pd.DataFrame(surv)
+    return cum_haz, surv
+
+
+cum_haz_df, surv_df = create_predictions(retention_df, base_idata, intention=False)
+surv_df
+
+```
+
+## Sample Survival Curves and their Marginal Expected Survival Trajectory
+```{python}
+from matplotlib import cm
+
+cm_subsection = np.linspace(0, 1, 120)
+colors_m = [cm.Reds(x) for x in cm_subsection]
+colors = [cm.spring(x) for x in cm_subsection]
+
+
+fig, axs = plt.subplots(1, 2, figsize=(20, 7))
+axs = axs.flatten()
+cum_haz_df.plot(legend=False, color=colors, alpha=0.05, ax=axs[1])
+axs[1].plot(cum_haz_df.mean(axis=1), color="black", linewidth=4)
+axs[1].set_title(
+    "Individual Cumulative Hazard \n & Marginal Expected Cumulative Hazard", fontsize=20
+)
+
+surv_df.plot(legend=False, color=colors_m, alpha=0.05, ax=axs[0])
+axs[0].plot(surv_df.mean(axis=1), color="black", linewidth=4)
+axs[0].set_title("Individual Survival Curves \n  & Marginal Expected Survival Curve", fontsize=20)
+axs[0].annotate(
+    f"Expected Attrition by 6 months: {100*np.round(1-surv_df.mean(axis=1).iloc[6], 2)}%",
+    (2, 0.5),
+    fontsize=14,
+    fontweight="bold",
+)
+```
+
+# Accelerated Failure Time Models
+```{python}
+from scipy.stats import fisk, weibull_min
+fig, axs = plt.subplots(2, 2, figsize=(20, 7))
+axs = axs.flatten()
+
+
+def make_loglog_haz(alpha, beta):
+    ## This is the Log Logistic distribution
+    dist = fisk(c=alpha, scale=beta)
+    t = np.log(np.linspace(1, 13, 100))  # Time values
+    pdf_values = dist.pdf(t)
+    sf_values = dist.sf(t)
+    haz_values = pdf_values / sf_values
+    axs[0].plot(t, haz_values)
+    axs[2].plot(t, sf_values)
+
+
+def make_weibull_haz(alpha, beta):
+    dist = weibull_min(c=alpha, scale=beta)
+    t = np.linspace(1, 13, 100)  # Time values
+    pdf_values = dist.pdf(t)
+    sf_values = dist.sf(t)
+    haz_values = pdf_values / sf_values
+    axs[1].plot(t, haz_values)
+    axs[3].plot(t, sf_values)
+
+
+[make_loglog_haz(4, b) for b in np.linspace(0.5, 2, 4)]
+[make_loglog_haz(a, 2) for a in np.linspace(0.2, 7, 4)]
+[make_weibull_haz(25, b) for b in np.linspace(10, 15, 4)]
+[make_weibull_haz(a, 3) for a in np.linspace(2, 7, 7)]
+axs[0].set_title("Log-Logistic Hazard Function", fontsize=15)
+axs[2].set_title("Log-Logistic Survival Function", fontsize=15)
+axs[1].set_title("Weibull Hazard Function", fontsize=15)
+axs[3].set_title("Weibull Survival Function", fontsize=15);
+
+```
+
+```{python}
+coords = {
+    "intervals": intervals,
+    "preds": [
+        "sentiment",
+        "intention",
+        "Male",
+        "Low",
+        "Medium",
+        "Finance",
+        "Health",
+        "Law",
+        "Public/Government",
+        "Sales/Marketing",
+    ],
+}
+
+X = retention_df[
+    [
+        "sentiment",
+        "intention",
+        "Male",
+        "Low",
+        "Medium",
+        "Finance",
+        "Health",
+        "Law",
+        "Public/Government",
+        "Sales/Marketing",
+    ]
+].copy()
+y = retention_df["month"].values
+cens = retention_df.left.values == 0
+
+stan_data_4 = {
+  'N': len(X),
+  'P': X.shape[1],
+  'X_data': X,
+  'y': y,
+  'cens': cens,
+  'is_weibull': 1,
+}
+
+stan_data_5 = {
+  'N': len(X),
+  'P': X.shape[1],
+  'X_data': X,
+  'y': np.log(y),
+  'cens': cens,
+  'is_weibull': 0,
+}
+
+aft_path = os.path.join(p_dir, 'models', 'weibull_log_log.stan')
+weibull_model_samples = os.path.join(p_dir, 'models', 'weibull_sample.csv')
+loglog_model_samples = os.path.join(p_dir, 'models', 'loglog_samples.csv')
+aft_model = CmdStanModel(stan_file=aft_path)
+```
+
+```{python}
+# Fit model
+if os.path.exists(weibull_model_samples): 
+    weibull_fit = from_csv(weibull_model_samples, method='sample')
+    print("Model loaded from existing samples.")
+else:
+    weibull_fit = aft_model.sample(data=stan_data_4, seed=RANDOM_SEED, chains=4, parallel_chains=4, iter_sampling=1000, show_console=True)
+    weibull_fit.save_csvfiles(weibull_model_samples)
+    print("Model run and saved.")
+
+if os.path.exists(loglog_model_samples):
+    loglog_fit = from_csv(loglog_model_samples, method='sample')
+    print("Model loaded from existing samples.")
+else:
+    loglog_fit = aft_model.sample(data=stan_data_5, seed=RANDOM_SEED, chains=4,parallel_chains=4, iter_sampling=1000, show_console=True)
+    loglog_fit.save_csvfiles(loglog_model_samples)
+    print("Model run and saved.")
+
+```
+
+```{python}
+weibull_idata = az.from_cmdstanpy(
+    weibull_fit,
+    log_likelihood="log_lik",
+    dims={'beta': ['preds'], },
+    coords={
+        'preds': preds2,  # Predictor names or indices
+    }
+)
+
+loglogistic_idata = az.from_cmdstanpy(
+    loglog_fit,
+    log_likelihood="log_lik",
+    dims={'beta': ['preds'], },
+    coords={
+        'preds': preds2,  # Predictor names or indices
+    }
+)
+```
+
+```{python}
+compare = az.compare({"weibull": weibull_idata, "loglogistic": loglogistic_idata}, ic="waic")
+compare
+```
+
+```{python}
+az.plot_compare(compare)
+```
+
+## Deriving Individual Survival Predictions from AFT models
+
+## Weibull
+```{python}
+fig, axs = plt.subplots(1, 2, figsize=(20, 7))
+axs = axs.flatten()
+#### Using the fact that we've already stored expected value for the regression equation
+reg = az.summary(weibull_idata, var_names=["reg"])["mean"]
+t = np.arange(1, 13, 1)
+s = az.summary(weibull_idata, var_names=["s"])["mean"][0]
+axs[0].hist(reg, bins=30, ec="black", color=c_mid)
+axs[0].set_title(
+    "Histogram of Acceleration Factors in the individual Weibull fits \n across our sample"
+)
+axs[1].plot(
+    t,
+    weibull_min.sf(t, s, scale=reg.iloc[0]),
+    label=r"Individual 1 - $\beta$: " + f"{reg.iloc[0]}," + r"$\alpha$: " + f"{s}",
+)
+axs[1].plot(
+    t,
+    weibull_min.sf(t, s, scale=reg.iloc[1000]),
+    label=r"Individual 1000 - $\beta$: " + f"{reg.iloc[1000]}," + r"$\alpha$: " + f"{s}",
+)
+axs[1].set_title("Comparing Impact of Individual Factor \n on Survival Function")
+axs[1].legend();
+
+```
+
+
+```{python}
+diff = reg.iloc[1000] - reg.iloc[0]
+pchange = np.round(100 * (diff / reg.iloc[1000]), 2)
+print(
+    f"In this case we could think of the relative change in acceleration \n factor between the individuals as representing a {pchange}% increase"
+)
+
+```
+
+```{python}
+reg = az.summary(weibull_idata, var_names=["reg"])["mean"]
+s = az.summary(weibull_idata, var_names=["s"])["mean"][0]
+t = np.arange(1, 13, 1)
+weibull_predicted_surv = pd.DataFrame(
+    [weibull_min.sf(t, s, scale=reg.iloc[i]) for i in range(len(reg))]
+).T
+
+weibull_predicted_surv
+
+```
+
+## Log Logistic
+```{python}
+reg = az.summary(loglogistic_idata, var_names=["reg"])["mean"]
+s = az.summary(loglogistic_idata, var_names=["s"])["mean"][0]
+temp = retention_df
+t = np.log(np.arange(1, 13, 1))
+## Transforming to the Log-Logistic scale
+alpha = np.round((1 / s), 3)
+beta = np.round(np.exp(reg) ** s, 3)
+
+fig, axs = plt.subplots(1, 2, figsize=(20, 7))
+axs = axs.flatten()
+axs[0].hist(reg, bins=30, ec="black", color=c_mid)
+axs[0].set_title("Histogram of beta terms in the individual Log Logistic fits")
+axs[1].plot(
+    np.exp(t),
+    fisk.sf(t, c=alpha, scale=beta.iloc[0]),
+    label=r"$\beta$: " + f"{beta.iloc[0]}," + r"$\alpha$: " + f"{alpha}",
+)
+axs[1].plot(
+    np.exp(t),
+    fisk.sf(t, c=alpha, scale=beta.iloc[1000]),
+    label=r"$\beta$: " + f"{beta.iloc[1000]}," + r"$\alpha$: " + f"{alpha}",
+)
+axs[1].set_title("Comparing Impact of Individual Factor \n on Survival Function")
+axs[1].legend();
+
+```
+
+
+```{python}
+loglogistic_predicted_surv = pd.DataFrame(
+    [fisk.sf(t, c=alpha, scale=beta.iloc[i]) for i in range(len(reg))]
+).T
+loglogistic_predicted_surv
+
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(20, 7))
+ax.plot(
+    loglogistic_predicted_surv.iloc[:, [1, 300]], label=["LL-Individual 1", "LL-Individual 300"]
+)
+ax.plot(
+    loglogistic_predicted_surv.mean(axis=1),
+    label="LL Marginal Survival Curve",
+    linestyle="--",
+    color="black",
+    linewidth=4.5,
+)
+ax.plot(weibull_predicted_surv.iloc[:, [1, 300]], label=["W-Individual 1", "W-Individual 300"])
+ax.plot(
+    weibull_predicted_surv.mean(axis=1),
+    label="W Marginal Survival Curve",
+    linestyle="dotted",
+    color="black",
+    linewidth=4.5,
+)
+ax.plot(surv_df.iloc[:, [1, 300]], label=["CoxPH-Individual 1", "CoxPH-Individual 300"])
+ax.plot(
+    surv_df.mean(axis=1),
+    label="CoxPH Marginal Survival Curve",
+    linestyle="-.",
+    color="black",
+    linewidth=4.5,
+)
+ax.set_title(
+    "Comparison predicted Individual Survival Curves and \n Marginal (expected) Survival curve across Sample",
+    fontsize=25,
+)
+ax.set_xlabel("Time in Month")
+ax.set_ylabel("Probability")
+ax.legend();
+
+```
+
+# Fit Model with Shared Frailty terms by Individual
+```{python}
+pz.style.use('preliz-doc')
+params = pz.maxent(pz.Gamma(), 0.80, 1.30, 0.90)
+```
+
+```{python}
+alpha = params[0].alpha
+beta = params[0].beta
+params = np.array([alpha, beta])
+```
+
+```{python}
+fig, ax = plt.subplots(figsize=(20, 6))
+ax.hist(
+    np.random.gamma(alpha, beta, size=1000),
+    ec="black",
+    color=c_dark,
+    bins=30,
+    alpha=0.4,
+)
+
+ax.set_title("Draws from Gamma", fontsize=20);
+```
+
+
+```{python}
+
+female_df = retention_df[retention_df['Male'] == 0]
+male_df = retention_df[retention_df['Male'] == 1]
+
+ordered_df = pd.concat([female_df, male_df], axis=0)
+ordered_df = ordered_df.reset_index(drop=True)
+
+intervals = np.arange(12)
+n_employees = ordered_df.shape[0]
+n_intervals = len(intervals)
+last_period = np.floor((ordered_df.month - 0.01) / 1).astype(int)
+employees = np.arange(n_employees)
+quit = np.zeros((n_employees, n_intervals))
+quit[employees, last_period] = ordered_df["left"]
+quit = quit.astype(int)
+quit_df = pd.DataFrame(quit)
+
+exposure = np.greater_equal.outer(ordered_df.month.to_numpy(), intervals) * 1
+exposure[employees, last_period] = ordered_df.month - intervals[last_period]
+exposure_df = pd.DataFrame(exposure)
+
+
+preds = [
+    "sentiment",
+    "intention",
+    "Low",
+    "Medium",
+    "Finance",
+    "Health",
+    "Law",
+    "Public/Government",
+    "Sales/Marketing",
+]
+preds3 = ["sentiment", "Low", "Medium"]
+
+stan_data_6 = {
+    'N': len(ordered_df),
+    'N_f': len(female_df),
+    'N_m': len(male_df),
+    'P': ordered_df[preds].shape[1],
+    'K': len(intervals),
+    'G': 2,
+    'F': len(ordered_df),
+    'optm_params': params,
+    'X_data_f': female_df[preds],
+    'X_data_m': male_df[preds],
+    'quit': quit,
+    'exposure': exposure,
+    'frailty_idx': list(range(1, len(ordered_df) + 1))
+}
+
+ordered_df['field_idx'], field_labels = pd.factorize(ordered_df['field'])
+
+stan_data_7 = {
+    'N': len(ordered_df),
+    'N_f': len(female_df),
+    'N_m': len(male_df),
+    'P': ordered_df[preds3].shape[1],
+    'K': len(intervals),
+    'G': 2,
+    'F': len(field_labels),
+    'optm_params': params,
+    'X_data_f': female_df[preds3],
+    'X_data_m': male_df[preds3],
+    'quit': quit,
+    'exposure': exposure,
+    'frailty_idx': list(ordered_df['field_idx'] + 1),
+}
+
+```
+
+
+
+
+```{python}
+frailty_path = os.path.join(p_dir, 'models', 'frailty_log_poisson.stan')
+frailty_model_samples = os.path.join(p_dir, 'models', 'frailty_samples.csv')
+shared_frailty_model_samples = os.path.join(p_dir, 'models', 'shared_frailty_samples.csv')
+frailty_model = CmdStanModel(stan_file=frailty_path)
+```
+
+```{python}
+# Fit model
+if os.path.exists(frailty_model_samples):
+    frailty = from_csv(frailty_model_samples, method='sample')
+    print("Model loaded from existing samples.")
+else:
+    frailty = frailty_model.sample(data=stan_data_6, seed=RANDOM_SEED, chains=4, parallel_chains=4, iter_sampling=1000, show_console=True)
+    frailty.save_csvfiles(frailty_model_samples)
+    print("Model run and saved.")
+
+if os.path.exists(shared_frailty_model_samples):
+    shared_frailty = from_csv(shared_frailty_model_samples, method='sample')
+    print("Model loaded from existing samples.")
+else:
+    shared_frailty = frailty_model.sample(data=stan_data_7, seed=RANDOM_SEED, chains=4, parallel_chains=4, iter_sampling=1000, show_console=True)
+    shared_frailty.save_csvfiles(shared_frailty_model_samples)
+    print("Model run and saved.")
+
+```
+
+```{python}
+frailty_idata = az.from_cmdstanpy(
+    frailty,
+    log_likelihood="log_lik",
+    dims={
+        'beta': ['preds'], 
+        'log_lik': ['individuals', 'intervals'], 
+        'lambda0': ['intervals', 'genders'],  # Consistent naming as 'genders'
+        'frailty': ['F']
+    },
+    coords={
+        'preds': preds, 
+        'individuals': list(range(len(retention_df))),  
+        'intervals': list(range(n_intervals)),  
+        'genders': ["Male", "Female"],  # Rename 'G' to 'genders'
+        'F': list(range(len(retention_df))),
+    },
+)
+
+```
+
+
+```{python}
+shared_frailty_idata = az.from_cmdstanpy(
+    shared_frailty,
+    log_likelihood='log_lik',
+    dims={
+        'beta': ['preds'], 
+        'log_lik': ['individuals', 'intervals'], 
+        'lambda0': ['intervals', 'genders'],  # Consistent naming as 'genders'
+        'frailty': ['F']
+    },
+    coords={
+        'preds': preds3,  
+        'individuals': list(range(len(retention_df))), 
+        'intervals': list(range(n_intervals)),  
+        'genders': ["Male", "Female"],  # Rename 'G' to 'genders'
+        'F': list(range(len(field_labels))),  # Matches field label length
+    },
+)
+```
+
+
+
+```{python}
+fig, ax = plt.subplots(figsize=(20, 6))
+base_m = shared_frailty_idata["posterior"]["lambda0"].sel(genders="Male")
+base_f = shared_frailty_idata["posterior"]["lambda0"].sel(genders="Female")
+az.plot_hdi(range(12), base_m, ax=ax, color="lightblue", fill_kwargs={"alpha": 0.5}, smooth=False)
+az.plot_hdi(range(12), base_f, ax=ax, color="red", fill_kwargs={"alpha": 0.3}, smooth=False)
+get_mean(base_m).plot(ax=ax, color="darkred", label="Male Baseline Hazard Shared Frailty")
+get_mean(base_f).plot(ax=ax, color="blue", label="Female Baseline Hazard Shared Frailty")
+
+base_m_i = frailty_idata["posterior"]["lambda0"].sel(genders="Male")
+base_f_i = frailty_idata["posterior"]["lambda0"].sel(genders="Female")
+az.plot_hdi(range(12), base_m_i, ax=ax, color="cyan", fill_kwargs={"alpha": 0.5}, smooth=False)
+az.plot_hdi(range(12), base_f_i, ax=ax, color="magenta", fill_kwargs={"alpha": 0.3}, smooth=False)
+get_mean(base_m_i).plot(ax=ax, color="cyan", label="Male Baseline Hazard Individual Frailty")
+get_mean(base_f_i).plot(ax=ax, color="magenta", label="Female Baseline Hazard Individual Frailty")
+
+
+ax.legend()
+ax.set_title("Stratified Baseline Hazards")
+```
+
+
+```{python}
+frailty_terms = az.summary(frailty_idata, var_names=["frailty"])
+frailty_terms.head()
+```
+
+
+```{python}
+axs = az.plot_posterior(shared_frailty_idata, var_names=["frailty"])
+axs = axs.flatten()
+for ax, label in zip(axs, field_labels):
+    ax.set_title(label) 
+    ax.axvline(1, color="red", label="No change")
+    ax.legend()
+
+plt.suptitle("Shared Frailty Estimates across the Job Area", fontsize=30)
+```
+
+
+```{python}
+ax = az.plot_forest(
+    [base_idata, base_intention_idata, weibull_idata, frailty_idata],
+    model_names=["coxph_sentiment", "coxph_intention", "weibull_sentiment", "frailty_intention"],
+    var_names=["beta"],
+    combined=True,
+    figsize=(20, 15),
+    r_hat=True,
+)
+
+ax[0].set_title("Parameter Estimates: Various Models", fontsize=20)
+
+```
+
+
+```{python}
+temp = retention_df.copy()
+temp["frailty"] = frailty_terms.reset_index()["mean"]
+(
+    temp.groupby(["Male", "sentiment", "intention"])[["frailty"]]
+    .mean()
+    .reset_index()
+    .pivot(index=["Male", "sentiment"], columns="intention", values="frailty")
+    .style.background_gradient(cmap="OrRd", axis=None)
+    .format(precision=3)
+)
+
+
+```
+
+# Interrogating the Cox Frailty Model
+```{python}
+def extract_individual_frailty(i, retention_df, intention=False):
+    beta = frailty_idata.posterior["beta"]
+    if intention:
+        intention_posterior = beta.sel(preds="intention")
+    else:
+        intention_posterior = 0
+    hazard_base_m = frailty_idata["posterior"]["lambda0"].sel(genders="Male")
+    hazard_base_f = frailty_idata["posterior"]["lambda0"].sel(genders="Female")
+    frailty = frailty_idata.posterior["frailty"]
+    if retention_df.iloc[i]["Male"] == 1:
+        hazard_base = hazard_base_m
+    else:
+        hazard_base = hazard_base_f
+
+    full_hazard_idata = hazard_base * (
+        frailty.sel(F=i).mean().item()
+        * np.exp(
+            beta.sel(preds="sentiment") * retention_df.iloc[i]["sentiment"]
+            + np.where(intention, intention_posterior * retention_df.iloc[i]["intention"], 0)
+            + beta.sel(preds="Low") * retention_df.iloc[i]["Low"]
+            + beta.sel(preds="Medium") * retention_df.iloc[i]["Medium"]
+            + beta.sel(preds="Finance") * retention_df.iloc[i]["Finance"]
+            + beta.sel(preds="Health") * retention_df.iloc[i]["Health"]
+            + beta.sel(preds="Law") * retention_df.iloc[i]["Law"]
+            + beta.sel(preds="Public/Government") * retention_df.iloc[i]["Public/Government"]
+            + beta.sel(preds="Sales/Marketing") * retention_df.iloc[i]["Sales/Marketing"]
+        )
+    )
+
+    cum_haz_idata = cum_hazard(full_hazard_idata)
+    survival_idata = survival(full_hazard_idata)
+    return full_hazard_idata, cum_haz_idata, survival_idata, hazard_base
+
+
+def plot_individual_frailty(retention_df, individuals=[1, 300, 700], intention=False):
+    fig, axs = plt.subplots(1, 2, figsize=(20, 7))
+    axs = axs.flatten()
+    colors = [c_light_highlight, c_mid_highlight, c_dark_highlight]
+    for i, c in zip(individuals, colors):
+        haz_idata, cum_haz_idata, survival_idata, base_hazard = extract_individual_frailty(
+            i, retention_df, intention
+        )
+        axs[0].plot(get_mean(survival_idata), label=f"individual_{i}", color=c)
+        az.plot_hdi(range(12), survival_idata, ax=axs[0], fill_kwargs={"color": c})
+        axs[1].plot(get_mean(cum_haz_idata), label=f"individual_{i}", color=c)
+        az.plot_hdi(range(12), cum_haz_idata, ax=axs[1], fill_kwargs={"color": c})
+        axs[0].set_title("Individual Survival Functions", fontsize=20)
+        axs[1].set_title("Individual Cumulative Hazard Functions", fontsize=20)
+    az.plot_hdi(
+        range(12),
+        survival(base_hazard),
+        color="lightblue",
+        ax=axs[0],
+        fill_kwargs={"label": "Baseline Survival"},
+    )
+    az.plot_hdi(
+        range(12),
+        cum_hazard(base_hazard),
+        color="lightblue",
+        ax=axs[1],
+        fill_kwargs={"label": "Baseline Hazard"},
+    )
+    axs[0].legend()
+    axs[1].legend()
+
+
+plot_individual_frailty(retention_df, [0, 1, 2], intention=True)
+
+```
+
+```{python}
+retention_df.iloc[0:3, :]
+
+```
+
+
+```{python}
+def create_predictions(retention_df, intention=False):
+    cum_haz = {}
+    surv = {}
+    for i in range(len(retention_df)):
+        haz_idata, cum_haz_idata, survival_idata, base_hazard = extract_individual_frailty(
+            i, retention_df, intention
+        )
+        cum_haz[i] = get_mean(cum_haz_idata)
+        surv[i] = get_mean(survival_idata)
+    cum_haz = pd.DataFrame(cum_haz)
+    surv = pd.DataFrame(surv)
+    return cum_haz, surv
+
+
+cum_haz_frailty_df, surv_frailty_df = create_predictions(retention_df, intention=True)
+surv_frailty_df
+```
+
+
+```{python}
+cm_subsection = np.linspace(0, 1, 120)
+colors_m = [cm.Reds(x) for x in cm_subsection]
+colors = [cm.spring(x) for x in cm_subsection]
+
+
+fig, axs = plt.subplots(1, 2, figsize=(20, 7))
+axs = axs.flatten()
+cum_haz_frailty_df.plot(legend=False, color=colors, alpha=0.05, ax=axs[1])
+axs[1].plot(cum_haz_frailty_df.mean(axis=1), color="black", linewidth=4)
+axs[1].set_title(
+    "Predicted Individual Cumulative Hazard \n & Expected Cumulative Hazard", fontsize=20
+)
+
+surv_frailty_df.plot(legend=False, color=colors_m, alpha=0.05, ax=axs[0])
+axs[0].plot(surv_frailty_df.mean(axis=1), color="black", linewidth=4)
+axs[0].set_title("Predicted Individual Survival Curves \n  & Expected Survival Curve", fontsize=20)
+axs[0].annotate(
+    f"Expected Attrition by 6 months: {np.round(1-surv_frailty_df.mean(axis=1).iloc[6], 3)}",
+    (2, 0.5),
+    fontsize=12,
+    fontweight="bold",
+);
+
+```
+
+## Plotting the effects of the Frailty Terms
+```{python}
+beta_individual_all = frailty_idata["posterior"]["frailty"]
+predicted_all = beta_individual_all.mean(("chain", "draw"))
+predicted_all = predicted_all.sortby(predicted_all, ascending=False)
+beta_individual = beta_individual_all.sel(F=range(500))
+predicted = beta_individual.mean(("chain", "draw"))
+predicted = predicted.sortby(predicted, ascending=False)
+ci_lb = beta_individual.quantile(0.025, ("chain", "draw")).sortby(predicted)
+ci_ub = beta_individual.quantile(0.975, ("chain", "draw")).sortby(predicted)
+hdi = az.hdi(beta_individual, hdi_prob=0.5).sortby(predicted)
+hdi2 = az.hdi(beta_individual, hdi_prob=0.8).sortby(predicted)
+
+
+```
+
+
+```{python}
+cm_subsection = np.linspace(0, 1, 500)
+colors = [cm.cool(x) for x in cm_subsection]
+
+fig = plt.figure(figsize=(20, 10))
+gs = fig.add_gridspec(
+    2,
+    2,
+    height_ratios=(1, 7),
+    left=0.1,
+    right=0.9,
+    bottom=0.1,
+    top=0.9,
+    wspace=0.05,
+    hspace=0.05,
+)
+
+# Create the Axes.
+ax = fig.add_subplot(gs[1, 0])
+ax.set_yticklabels([])
+ax_histx = fig.add_subplot(gs[0, 0], sharex=ax)
+ax_histx.set_title("Expected Frailty Terms per Individual Risk Profile", fontsize=20)
+ax_histx.hist(predicted_all, bins=30, color="slateblue")
+ax_histx.set_yticklabels([])
+ax_histx.tick_params(labelsize=8)
+ax.set_ylabel("Individual Frailty Terms", fontsize=18)
+ax.tick_params(labelsize=8)
+ax.hlines(
+    range(len(predicted)),
+    hdi.sel(hdi="lower").to_array(),
+    hdi.sel(hdi="higher").to_array(),
+    color=colors,
+    label="50% HDI",
+    linewidth=0.8,
+)
+ax.hlines(
+    range(len(predicted)),
+    hdi2.sel(hdi="lower").to_array(),
+    hdi2.sel(hdi="higher").to_array(),
+    color="green",
+    alpha=0.2,
+    label="80% HDI",
+    linewidth=0.8,
+)
+ax.set_xlabel("Multiplicative Effect of Individual Frailty", fontsize=18)
+ax.legend()
+ax.fill_betweenx(range(len(predicted)), 0.95, 1.0, alpha=0.4, color="grey")
+
+ax1 = fig.add_subplot(gs[1, 1])
+f_index = retention_df[retention_df["gender"] == "F"].index
+index = retention_df.index
+surv_frailty_df[list(range(len(f_index)))].plot(ax=ax1, legend=False, color="red", alpha=0.8)
+surv_frailty_df[list(range(len(f_index), len(index), 1))].plot(
+    ax=ax1, legend=False, color="royalblue", alpha=0.1
+)
+ax1_hist = fig.add_subplot(gs[0, 1])
+f_index = retention_df[retention_df["gender"] == "F"].index
+ax1_hist.hist(
+    (1 - surv_frailty_df[list(range(len(f_index), len(index), 1))].iloc[6]),
+    bins=30,
+    color="royalblue",
+    ec="black",
+    alpha=0.8,
+)
+ax1_hist.hist(
+    (1 - surv_frailty_df[list(range(len(f_index)))].iloc[6]),
+    bins=30,
+    color="red",
+    ec="black",
+    alpha=0.8,
+)
+ax1.set_xlabel("Time", fontsize=18)
+ax1_hist.set_title(
+    "Predicted Distribution of Attrition \n by 6 Months across all risk profiles", fontsize=20
+)
+ax1.set_ylabel("Survival Function", fontsize=18)
+ax.scatter(predicted, range(len(predicted)), color="black", ec="black", s=30)
+
+# Create a manual legend without Line2D
+ax1.legend(["Female", "Male"], loc="upper right", fontsize=12)
+
+
+
+```
+
+```{python}
+
+
+```
